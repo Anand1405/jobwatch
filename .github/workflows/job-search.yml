@@ -1,3 +1,4 @@
+# job-search poller (runs every 5 min)
 name: job-search
 on:
   schedule:
