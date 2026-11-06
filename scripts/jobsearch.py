@@ -284,6 +284,29 @@ def evaluate(job, P, C):
     return ev
 
 
+YEARS_RE = re.compile(r"(\d{1,2})\s*(?:\+|plus)?\s*(?:-|–|to)?\s*(\d{1,2})?\s*\+?\s*(?:years?|yrs?)\b", re.I)
+
+
+def required_years(text):
+    """Highest 'N+ years ... experience' lower bound mentioned in the JD, or None."""
+    best = None
+    t = text or ""
+    for m in YEARS_RE.finditer(t):
+        n = int(m.group(1))
+        if not 1 <= n <= 20:
+            continue
+        ctx = t[max(0, m.start() - 60):m.end() + 70].lower()
+        if not re.search(r"experience|exp\b|background|track record|working with|hands-on", ctx):
+            continue
+        if re.search(r"founded|in business|history of|over the (?:past|last) \d|years? (?:ago|old)|warranty|trial|guarantee", ctx):
+            continue
+        best = max(best or 0, n)
+    return best
+
+
+SENIOR_TITLE = re.compile(r"\b(senior|sr\.?|lead|principal|staff|head)\b", re.I)
+
+
 def _evaluate(job, P, C, mode="remote"):
     """-> dict(ok, score, reasons, flags, tier, reject)"""
     RL = P.get("relocation") or {}
@@ -352,6 +375,24 @@ def _evaluate(job, P, C, mode="remote"):
         return rej("none of must_have_any skills")
     score = best + min(30, len(skills) * 5)
     reasons = [f"title~{hit}"] + ([f"skills: {', '.join(skills[:6])}"] if skills else [])
+    # experience fit (profile.years_experience, default 4)
+    mine = P.get("years_experience", 4)
+    need = required_years(job["text"])
+    cap_y = P.get("max_required_years", mine + 1)
+    if need is not None:
+        if need > cap_y:
+            return rej(f"needs {need}+ yrs (you ~{mine})")
+        if need == cap_y and need > mine:
+            score -= 15
+            flags.append(f"asks {need}+ yrs (you ~{mine}) - stretch")
+        elif need <= mine:
+            score += 8
+            reasons.append(f"exp ok ({need}+ yrs)")
+        else:
+            score -= 5
+    elif SENIOR_TITLE.search(job["title"]):
+        score -= 8
+        flags.append("senior title, years not stated")
     if mode == "reloc":
         score += 10
         reasons.append("visa/relocation support")
