@@ -1,0 +1,46 @@
+name: job-search
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+concurrency:
+  group: job-search
+  cancel-in-progress: false
+permissions:
+  actions: write
+  contents: read
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      JOBSEARCH_HOME: /home/runner/.job-search
+      JOBSEARCH_TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      JOBSEARCH_TG_CHAT: ${{ secrets.TG_CHAT }}
+      PROFILE_JSON: ${{ secrets.PROFILE_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.job-search/state.sqlite
+          key: js-state-${{ github.run_id }}
+          restore-keys: js-state-
+      - name: Write config
+        run: |
+          mkdir -p "$JOBSEARCH_HOME"
+          printf '%s' "$PROFILE_JSON" > "$JOBSEARCH_HOME/profile.json"
+          cp config.json companies.json "$JOBSEARCH_HOME/"
+      - name: Poll
+        run: python3 -I scripts/jobsearch.py run
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.job-search/state.sqlite
+          key: js-state-${{ github.run_id }}
+      - name: Keep schedule alive (GitHub disables idle public-repo crons after 60 days)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/job-search.yml/enable" || true

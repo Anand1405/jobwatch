@@ -1,0 +1,31 @@
+{
+  "telegram": {
+    "bot_token": "",
+    "chat_id": ""
+  },
+  "poll_interval_min": 5,
+  "max_age_minutes": 360,
+  "max_alerts_per_cycle": 25,
+  "min_score": 50,
+  "unknown_salary_min_score": 60,
+  "heartbeat_hours": 24,
+  "sources": {
+    "remoteok": true,
+    "remotive": true,
+    "jobicy": true,
+    "himalayas": true,
+    "workingnomads": true,
+    "wwr": true,
+    "hn_jobs": true,
+    "hn_hiring": true,
+    "remoterocketship": true,
+    "ats": true,
+    "arbeitnow": true
+  },
+  "source_interval_min": {
+    "remotive": 360,
+    "ats": 10,
+    "remoterocketship": 15,
+    "hn_hiring": 20
+  }
+}
