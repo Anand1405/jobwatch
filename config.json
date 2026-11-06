@@ -27,5 +27,7 @@
     "ats": 10,
     "remoterocketship": 15,
     "hn_hiring": 20
-  }
+  },
+  "max_per_company": 2,
+  "company_window_days": 30
 }

@@ -705,6 +705,17 @@ class DB:
         CREATE TABLE IF NOT EXISTS alerted(fp TEXT PRIMARY KEY, id TEXT, ts INT, score INT, job TEXT);
         CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);""")
         self.lock = threading.Lock()
+        try:
+            self.c.execute("ALTER TABLE alerted ADD COLUMN ckey TEXT")
+        except sqlite3.OperationalError:
+            pass
+        for fp, jb in self.c.execute("SELECT fp, job FROM alerted WHERE ckey IS NULL").fetchall():
+            self.c.execute("UPDATE alerted SET ckey=? WHERE fp=?", (company_key(json.loads(jb)), fp))
+        self.c.commit()
+
+    def company_count(self, ck, days):
+        with self.lock:
+            return self.c.execute("SELECT COUNT(*) FROM alerted WHERE ckey=? AND ts>?", (ck, time.time() - days * 86400)).fetchone()[0]
 
     def seen(self, jid):
         with self.lock:
@@ -729,7 +740,8 @@ class DB:
 
     def add_alert(self, fp, job, score):
         with self.lock:
-            self.c.execute("INSERT OR REPLACE INTO alerted VALUES(?,?,?,?,?)", (fp, job["id"], int(time.time()), score, json.dumps(job)))
+            self.c.execute("INSERT OR REPLACE INTO alerted(fp,id,ts,score,job,ckey) VALUES(?,?,?,?,?,?)",
+                           (fp, job["id"], int(time.time()), score, json.dumps(job), company_key(job)))
             self.c.commit()
 
 # ----------------------------------------------------------------- telegram
@@ -775,6 +787,10 @@ def fmt_msg(job, ev):
     return "\n".join(lines)
 
 
+def company_key(job):
+    return re.sub(r"[^a-z0-9]", "", (job.get("company") or "").split(":")[0].lower())
+
+
 def fingerprint(job):
     n = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
     return hashlib.sha1((n(job["company"].split(":")[0]) + "|" + n(job["title"])).encode()).hexdigest()
@@ -799,12 +815,12 @@ def cmd_init(a=None):
     print("\nNext: edit config.json (telegram), profile.json (from resume), then `jobsearch.py tg-test` and `jobsearch.py run --dry-run`")
 
 # ----------------------------------------------------------------- pipeline
-def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink):
+def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=False):
     """Evaluate unseen jobs; sink(job, ev) delivers. Returns stats."""
     st = dict(new=0, match=0, sent=0)
     cands, batch_fp = [], set()
     for j in jobs:
-        if not j.get("id") or db.seen(j["id"]):
+        if not j.get("id") or (db.seen(j["id"]) and not ignore_seen):
             continue
         st["new"] += 1
         if first_run and not j.get("posted"):
@@ -825,11 +841,23 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink):
         batch_fp.add(fp)
         cands.append((ev["score"], j, ev))
     st["match"] = len(cands)
-    for _, j, ev in sorted(cands, key=lambda x: -x[0])[: C.get("max_alerts_per_cycle", 25)]:
+    cap, win = C.get("max_per_company", 2), C.get("company_window_days", 30)
+    batch_ck, sent_n = {}, 0
+    for _, j, ev in sorted(cands, key=lambda x: -x[0]):
+        if sent_n >= C.get("max_alerts_per_cycle", 25):
+            break
+        ck = company_key(j)
+        if ck and cap and db.company_count(ck, win) + batch_ck.get(ck, 0) >= cap:
+            if not dry: db.mark(j["id"])
+            log.debug("cap: %s already has %d alerts", ck, cap)
+            continue
+        batch_ck[ck] = batch_ck.get(ck, 0) + 1
+        sent_n += 1
         try:
             sink(j, ev)
         except Exception as e:
             log.error("deliver failed %s: %s", j["id"], e)
+            batch_ck[ck] -= 1; sent_n -= 1
             continue
         if not dry:
             db.mark(j["id"]); db.add_alert(fingerprint(j), j, ev["score"])
@@ -838,7 +866,7 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink):
     return st
 
 
-def run_cycle(C, P, db, dry=False, only=None, max_age_min=None):
+def run_cycle(C, P, db, dry=False, only=None, max_age_min=None, backfill=False):
     max_age_s = (max_age_min or C.get("max_age_minutes", 360)) * 60
     enabled = {k: v for k, v in C.get("sources", {k: True for k in SOURCES}).items() if v}
     intervals = {**DEFAULT_INTERVALS, **C.get("source_interval_min", {})}
@@ -856,7 +884,7 @@ def run_cycle(C, P, db, dry=False, only=None, max_age_min=None):
         if only and name not in only or (not only and name not in enabled):
             continue
         last = float(db.meta("last:" + name) or 0)
-        if not only and time.time() - last < intervals.get(name, C.get("poll_interval_min", 5)) * 60 - 20:
+        if not only and not backfill and time.time() - last < intervals.get(name, C.get("poll_interval_min", 5)) * 60 - 20:
             continue
         t0 = time.time()
         try:
@@ -870,7 +898,7 @@ def run_cycle(C, P, db, dry=False, only=None, max_age_min=None):
         if not dry:
             db.meta("last:" + name, time.time())
         first = db.meta("base:" + name) is None
-        st = process(jobs, P, C, db, name, first, dry, max_age_s, sink)
+        st = process(jobs, P, C, db, name, first and not backfill, dry, max_age_s, sink, ignore_seen=backfill)
         if not dry:
             db.meta("base:" + name, 1)
         log.info("%-16s fetched=%-4d new=%-4d match=%-3d sent=%-3d %.1fs%s", name, len(jobs), st["new"], st["match"], st["sent"],
@@ -884,7 +912,7 @@ def cmd_run(a):
     if not P.get("target_titles"):
         raise SystemExit("profile.json has no target_titles. Run `init` and fill the profile.")
     only = a.sources.split(",") if a.sources else None
-    t = run_cycle(C, P, db, a.dry_run, only, a.max_age_min)
+    t = run_cycle(C, P, db, a.dry_run, only, a.max_age_min, a.backfill)
     print("cycle:", t)
     hb = C.get("heartbeat_hours", 24)
     if hb and not a.dry_run and not only:  # one-shot (cloud cron) mode heartbeat
@@ -893,8 +921,7 @@ def cmd_run(a):
             db.meta("last_hb", time.time())
         elif time.time() - last > hb * 3600:
             fails = {n: db.meta("fail:" + n) for n in SOURCES if int(db.meta("fail:" + n) or 0) > 5}
-            tg_send(C, f"💓 job-search alive (cloud). last cycle: {t}" + (f"
-⚠ failing sources: {fails}" if fails else ""))
+            tg_send(C, f"💓 job-search alive (cloud). last cycle: {t}" + (f"\n⚠ failing sources: {fails}" if fails else ""))
             db.meta("last_hb", time.time())
 
 
@@ -982,6 +1009,7 @@ def main():
     sp.add_parser("daemon").set_defaults(fn=cmd_daemon)
     r = sp.add_parser("run"); r.set_defaults(fn=cmd_run)
     r.add_argument("--dry-run", action="store_true"); r.add_argument("--sources"); r.add_argument("--max-age-min", type=int)
+    r.add_argument("--backfill", action="store_true", help="re-evaluate already-seen jobs (use with --max-age-min)")
     i = sp.add_parser("ingest"); i.set_defaults(fn=cmd_ingest)
     i.add_argument("file"); i.add_argument("--label", default="sweep"); i.add_argument("--dry-run", action="store_true")
     s = sp.add_parser("show"); s.set_defaults(fn=cmd_show); s.add_argument("id")
