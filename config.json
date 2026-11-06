@@ -7,7 +7,7 @@
   "max_age_minutes": 360,
   "max_alerts_per_cycle": 25,
   "min_score": 50,
-  "unknown_salary_min_score": 60,
+  "unknown_salary_min_score": 55,
   "heartbeat_hours": 24,
   "sources": {
     "remoteok": true,
