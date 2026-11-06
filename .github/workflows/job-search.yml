@@ -3,6 +3,10 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      backfill_hours:
+        description: Re-send matches from the last N hours (0 = normal run)
+        default: '0'
 concurrency:
   group: job-search
   cancel-in-progress: false
@@ -32,7 +36,14 @@ jobs:
           printf '%s' "$PROFILE_JSON" > "$JOBSEARCH_HOME/profile.json"
           cp config.json companies.json "$JOBSEARCH_HOME/"
       - name: Poll
-        run: python3 -I scripts/jobsearch.py run
+        env:
+          BACKFILL: ${{ github.event.inputs.backfill_hours }}
+        run: |
+          if [ -n "$BACKFILL" ] && [ "$BACKFILL" != "0" ]; then
+            python3 -I scripts/jobsearch.py run --backfill --max-age-min $(( BACKFILL * 60 ))
+          else
+            python3 -I scripts/jobsearch.py run
+          fi
       - name: Save state
         if: always()
         uses: actions/cache/save@v4

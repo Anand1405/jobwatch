@@ -667,10 +667,37 @@ def _ashby(ctx, token):
     return out
 
 
+def _workable(ctx, token):
+    out = []
+    d = http(f"https://apply.workable.com/api/v1/widget/accounts/{token}?details=true")
+    for r in d.get("jobs", []):
+        loc = ", ".join(x for x in (r.get("city"), r.get("state"), r.get("country")) if x)
+        remote = True if r.get("telecommuting") else None
+        j = J(f"workable:{token}", r.get("shortcode"), r.get("title"), d.get("name") or token, r.get("url") or r.get("shortlink"),
+              iso_epoch(r.get("published_on") or r.get("created_at")), loc or ("Remote" if remote else ""), remote,
+              r.get("employment_type", ""), clean(r.get("description")))
+        j["id"] = f"workable:{token}:{r.get('shortcode')}"
+        out.append(j)
+    return out
+
+
+def _recruitee(ctx, token):
+    out = []
+    for r in http(f"https://{token}.recruitee.com/api/offers/").get("offers", []):
+        loc = r.get("location") or ", ".join(x for x in (r.get("city"), r.get("country")) if x)
+        j = J(f"recruitee:{token}", r["id"], r.get("title"), r.get("company_name") or token, r.get("careers_url"),
+              iso_epoch(r.get("published_at") or r.get("created_at")), loc,
+              True if (r.get("remote") or r.get("on_site") is False and r.get("hybrid") is False) else None,
+              r.get("employment_type_code", ""), clean((r.get("description") or "") + " " + (r.get("requirements") or "")))
+        j["id"] = f"recruitee:{token}:{r['id']}"
+        out.append(j)
+    return out
+
+
 def f_ats(ctx):
     cf = HOME / "companies.json"
     boards = json.loads(cf.read_text(encoding="utf-8")) if cf.exists() else {}
-    tasks = [(fn, ctx, t) for key, fn in (("greenhouse", _gh), ("lever", _lever), ("ashby", _ashby)) for t in boards.get(key, [])]
+    tasks = [(fn, ctx, t) for key, fn in (("greenhouse", _gh), ("lever", _lever), ("ashby", _ashby), ("workable", _workable), ("recruitee", _recruitee)) for t in boards.get(key, [])]
     out, dead = [], []
 
     def run(a):

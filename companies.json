@@ -79,7 +79,19 @@
     "xai",
     "yugabyte",
     "zocdoc",
-    "zscaler"
+    "zscaler",
+    "bitwarden",
+    "coreweave",
+    "galileo",
+    "ghost",
+    "gofundme",
+    "lokalise",
+    "mattermost",
+    "proton",
+    "railsware",
+    "stackblitz",
+    "upwork",
+    "wikimedia"
   ],
   "lever": [
     "palantir",
@@ -94,7 +106,8 @@
     "pigment",
     "sonatype",
     "toptal",
-    "veeva"
+    "veeva",
+    "articulate"
   ],
   "ashby": [
     "openai",
@@ -165,6 +178,39 @@
     "vanta",
     "weaviate",
     "webflow",
-    "writer"
+    "writer",
+    "baseten",
+    "braintrust",
+    "browserbase",
+    "buffer",
+    "cerebras",
+    "clerk",
+    "close",
+    "crusoe",
+    "e2b",
+    "exa",
+    "firecrawl",
+    "fireworks",
+    "ghost",
+    "gitbook",
+    "helpscout",
+    "hubstaff",
+    "lambda",
+    "oyster",
+    "patronus",
+    "phrase",
+    "prefect",
+    "resend",
+    "terminal",
+    "unstructured",
+    "velocity",
+    "workos"
+  ],
+  "workable": [
+    "freelancer",
+    "huggingface",
+    "infinum",
+    "monterail",
+    "netguru"
   ]
 }
