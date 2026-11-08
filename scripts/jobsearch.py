@@ -24,10 +24,10 @@ HOME = Path(os.environ.get("JOBSEARCH_HOME") or Path.home() / ".job-search")
 UA = "Mozilla/5.0 (compatible; job-search/1.0)"
 LOCK_PORT = 47831
 
-FX = {"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "CAD": 0.73, "AUD": 0.65, "SGD": 0.74, "CHF": 1.12}
+FX = {"INR": 0.012, "USD": 1.0, "EUR": 1.08, "GBP": 1.27, "CAD": 0.73, "AUD": 0.65, "SGD": 0.74, "CHF": 1.12}
 PER_MULT = {"year": 1, "month": 12, "week": 52, "day": 260, "hour": 2080}
 SOURCE_MAX_AGE_H = {"remotive": 72}  # remotive delays listings ~24h
-DEFAULT_INTERVALS = {"remotive": 360, "hn_hiring": 20, "hn_jobs": 15, "remoterocketship": 15, "ats": 10}
+DEFAULT_INTERVALS = {"linkedin": 15, "remotive": 360, "hn_hiring": 20, "hn_jobs": 15, "remoterocketship": 15, "ats": 10}
 
 log = logging.getLogger("jobsearch")
 
@@ -110,10 +110,10 @@ def tokens(s):
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 
-def when_str(posted):
+def when_str(posted, note=""):
     """'12 min ago (07 Nov 10:42 IST)'"""
     if not posted:
-        return "time unknown"
+        return note or "time unknown"
     return f"{age_str(posted)} ({dt.datetime.fromtimestamp(posted, IST).strftime('%d %b %H:%M')} IST)"
 
 
@@ -182,6 +182,35 @@ def parse_salary(text):
     return None
 
 
+UNIT = {"l": 1e5, "lpa": 1e5, "lakh": 1e5, "lakhs": 1e5, "lac": 1e5, "lacs": 1e5, "cr": 1e7, "crore": 1e7, "crores": 1e7, "k": 1e3}
+INR_LPA = re.compile(r"(\d+(?:\.\d+)?)(?:\s?(?:-|–|—|to)\s?(\d+(?:\.\d+)?))?\s?(?:lpa|lakhs?|lacs?)\b", re.I)
+INR_SYM = re.compile(r"(?:₹|\binr\b|\brs\.?)\s?(\d[\d,]*(?:\.\d+)?)\s?(lpa|lakhs?|lacs?|l|cr(?:ores?)?|k)?\b"
+                     r"(?:\s?(?:-|–|—|to)\s?(?:₹|inr|rs\.?)?\s?(\d[\d,]*(?:\.\d+)?)\s?(lpa|lakhs?|lacs?|l|cr(?:ores?)?|k)?\b)?", re.I)
+
+
+def parse_inr(text):
+    """Annual INR salary range (lo, hi) from '50 LPA', '₹50L-70L', 'INR 5,000,000/yr', or None."""
+    t = text or ""
+    m = INR_LPA.search(t)
+    if m:
+        lo = float(m.group(1)) * 1e5
+        hi = float(m.group(2)) * 1e5 if m.group(2) else lo
+        return (min(lo, hi), max(lo, hi)) if 1e5 <= max(lo, hi) <= 1e8 else None
+    for m in INR_SYM.finditer(t):
+        u1 = UNIT.get((m.group(2) or "").lower(), 1)
+        lo = float(m.group(1).replace(",", "")) * u1
+        hi = lo
+        if m.group(3):
+            u2 = UNIT.get((m.group(4) or "").lower(), u1)
+            hi = float(m.group(3).replace(",", "")) * u2
+        win = t[max(0, m.start() - 25):m.end() + 25].lower()
+        mult = 12 if re.search(r"per month|/\s?mo|monthly|/month|\bpm\b", win) else 1
+        lo, hi = lo * mult, hi * mult
+        if 3e5 <= max(lo, hi) <= 1e8:
+            return (min(lo, hi), max(lo, hi))
+    return None
+
+
 def sal_annual(sal):
     fx = FX.get(sal["cur"])
     if fx is None:
@@ -193,6 +222,10 @@ def sal_annual(sal):
 def fmt_sal(sal):
     if not sal:
         return "unlisted"
+    if sal["cur"] == "INR":
+        m = PER_MULT[sal["per"]]
+        lo, hi = sal["min"] * m / 1e5, sal["max"] * m / 1e5
+        return f"₹{lo:g} LPA" if lo == hi else f"₹{lo:g}–{hi:g} LPA"
     sym = {"USD": "$", "EUR": "€", "GBP": "£"}.get(sal["cur"], sal["cur"] + " ")
     def f(v):
         return f"{v / 1000:.0f}k" if v >= 10000 else f"{v:g}"
@@ -419,9 +452,17 @@ def _evaluate(job, P, C, mode="remote"):
     # salary
     sal = job.get("sal") or parse_salary(job["sal_text"]) or parse_salary(job["text"][:5000])
     tier = ""
+    inr_ok = False
+    if not sal or sal["cur"] == "INR":
+        ri = parse_inr(job["sal_text"] + " " + job["text"][:5000])
+        if ri and not (sal and sal["cur"] != "INR"):
+            sal = dict(min=ri[0], max=ri[1], cur="INR", per="year")
+    if sal and sal["cur"] == "INR":
+        inr_min = P.get("india_min_inr_annual", 5000000)  # 50 LPA
+        if sal["max"] * PER_MULT[sal["per"]] < inr_min:
+            return rej(f"INR pay {fmt_sal(sal)} below {inr_min / 1e5:g} LPA")
+        inr_ok = True
     if sal:
-        if sal["cur"] == "INR":
-            return rej("INR pay")
         lo_a, hi_a = sal_annual(sal)
         if hi_a is None:
             flags.append(f"salary in {sal['cur']} - check")
@@ -440,6 +481,9 @@ def _evaluate(job, P, C, mode="remote"):
         else:
             hourly_ok = mode == "remote" and is_c and hi_a >= P.get("contract_min_annual_usd", 79000)
             annual_ok = hi_a >= min_ann
+        if inr_ok:
+            hourly_ok, annual_ok = False, True
+            reasons.append(f"INR pay >= {P.get('india_min_inr_annual', 5000000) / 1e5:g} LPA")
         if not (hourly_ok or annual_ok):
             return rej(f"pay {fmt_sal(sal)} below target")
         score += 25 if (sal["min"] * FX.get(sal["cur"], 1) * PER_MULT[sal["per"]] >= min_ann or hourly_ok) else 15
@@ -455,6 +499,11 @@ def _evaluate(job, P, C, mode="remote"):
             flags.append(f"contract: negotiate ${P['contract_hourly_band'][0]}-{P['contract_hourly_band'][1]}/hr")
         tier = "✈️❔" if mode == "reloc" else "❔"
     job["_sal"] = sal
+    if not sal and mode == "remote":
+        loc_l = job["location"].lower()
+        if re.search(r"\bindia\b", loc_l) and not re.search(r"worldwide|anywhere|global|apac|asia", loc_l) \
+                and not re.search(r"\busd\b|us\$|\beur\b|paid in (?:usd|dollars|euros?)", job["text"].lower()):
+            return rej("India-based role, pay unlisted (likely INR, need >=50 LPA)")
 
     # recency
     if job.get("posted"):
@@ -772,9 +821,79 @@ def f_ats(ctx):
     return out
 
 
+LI_BASE = "https://www.linkedin.com/jobs-guest/jobs/api"
+LI_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          "Accept-Language": "en-US,en;q=0.9"}
+LI_DEFAULT_Q = ["AI Engineer", "Generative AI Engineer", "LLM Engineer", "Machine Learning Engineer", "Applied AI Engineer",
+                "MLOps Engineer", "Forward Deployed Engineer", "AI Agent Engineer", "NLP Engineer", "Data Scientist"]
+
+
+def _li_search(q, geoid, remote, window_s, extra=""):
+    import urllib.parse as up
+    params = {"keywords": (q + " " + extra).strip(), "geoId": geoid, "f_TPR": f"r{window_s}", "start": 0}
+    if remote:
+        params["f_WT"] = 2
+    h = http(f"{LI_BASE}/seeMoreJobPostings/search?" + up.urlencode(params), LI_HDR, raw=True).decode("utf-8", "replace")
+    out = []
+    for c in h.split("<li>")[1:]:
+        m = re.search(r"jobPosting:(\d+)", c) or re.search(r"-(\d{8,})\?", c)
+        t = re.search(r'base-search-card__title">\s*(.*?)\s*<', c, re.S)
+        co = re.search(r'base-search-card__subtitle">.*?>\s*(.*?)\s*<', c, re.S)
+        loc = re.search(r'job-search-card__location">\s*(.*?)\s*<', c, re.S)
+        if m and t:
+            out.append((m.group(1), html.unescape(t.group(1)), html.unescape(co.group(1)) if co else "", html.unescape(loc.group(1)) if loc else ""))
+    return out
+
+
+def f_linkedin(ctx):
+    """LinkedIn public (guest) job search - no login. Freshness via f_TPR window; detail page for JD."""
+    P, C = ctx.P, ctx.C
+    qs = P.get("linkedin_queries") or LI_DEFAULT_Q
+    window = int(C.get("linkedin_window_min", 180)) * 60
+    searches = [(q, "92000000", True, "") for q in qs] + [(q, "102713980", True, "") for q in qs[:6]]
+    if (P.get("relocation") or {}).get("enabled"):
+        searches += [(q, "92000000", False, "visa sponsorship") for q in qs[:5]]
+    cards, seen_ids = [], set()
+    for q, geoid, remote, extra in searches:
+        try:
+            res = _li_search(q, geoid, remote, window, extra)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 999):
+                log.warning("linkedin rate-limited (%s) - stopping this cycle", e.code)
+                break
+            continue
+        for jid, title, comp, loc in res:
+            if jid not in seen_ids:
+                seen_ids.add(jid)
+                cards.append((jid, title, comp, loc, remote, bool(extra)))
+        time.sleep(0.4)
+    out = []
+    for jid, title, comp, loc, remote, sponsor in cards:
+        full = f"linkedin:{jid}"
+        if ctx.seen(full) or not any(set(tokens(t)) <= set(tokens(title)) for t in P.get("target_titles", [])):
+            continue
+        try:
+            d = http(f"{LI_BASE}/jobPosting/{jid}", LI_HDR, raw=True).decode("utf-8", "replace")
+        except Exception:
+            continue
+        desc = re.search(r'show-more-less-html__markup[^>]*>(.*?)</div>', d, re.S)
+        crit = dict((clean(a), clean(b)) for a, b in re.findall(
+            r'description__job-criteria-subheader">\s*(.*?)\s*</h3>.*?description__job-criteria-text[^>]*>\s*(.*?)\s*</span>', d, re.S))
+        sal = re.search(r'compensation__salary[^>]*>\s*(.*?)\s*<', d, re.S)
+        j = J("linkedin", jid, title, comp, f"https://www.linkedin.com/jobs/view/{jid}", None, loc,
+              True if remote else None, crit.get("Employment type", ""), clean(desc.group(1)) if desc else "", None,
+              clean(sal.group(1)) if sal else "")
+        j["posted_text"] = f"within last {int(window / 60)} min window (LinkedIn)"
+        if sponsor:
+            j["sponsor"] = True
+        out.append(j)
+        time.sleep(0.3)
+    return out
+
+
 SOURCES = {"remoteok": f_remoteok, "remotive": f_remotive, "jobicy": f_jobicy, "himalayas": f_himalayas,
            "workingnomads": f_workingnomads, "arbeitnow": f_arbeitnow, "wwr": f_wwr, "hn_jobs": f_hn_jobs, "hn_hiring": f_hn_hiring,
-           "remoterocketship": f_remoterocketship, "ats": f_ats}
+           "remoterocketship": f_remoterocketship, "linkedin": f_linkedin, "ats": f_ats}
 
 # ----------------------------------------------------------------- storage
 class DB:
@@ -884,7 +1003,7 @@ def fmt_msg(job, ev):
         f"<b>💼 Type:</b> {e(job['employment'] or 'not stated')}",
         f"<b>💰 Pay:</b> {e(fmt_sal(sal))}",
         f"<b>🧠 Experience:</b> {e(exp)}",
-        f"<b>🕒 Posted:</b> {e(when_str(job.get('posted')))}",
+        f"<b>🕒 Posted:</b> {e(when_str(job.get('posted'), job.get('posted_text', '')))}",
         f"<b>📡 Source:</b> {e(src)}   <b>🎯 Score:</b> {ev['score']}/100",
         "",
         "<b>✅ Why it fits</b>",

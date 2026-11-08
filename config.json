@@ -20,15 +20,18 @@
     "hn_hiring": true,
     "remoterocketship": true,
     "ats": true,
-    "arbeitnow": true
+    "arbeitnow": true,
+    "linkedin": true
   },
   "source_interval_min": {
     "remotive": 360,
     "ats": 10,
     "remoterocketship": 15,
-    "hn_hiring": 20
+    "hn_hiring": 20,
+    "linkedin": 15
   },
   "max_per_company": 2,
   "company_window_days": 30,
-  "max_per_source_day": 8
+  "max_per_source_day": 8,
+  "linkedin_window_min": 180
 }
