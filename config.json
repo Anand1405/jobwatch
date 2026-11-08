@@ -29,5 +29,6 @@
     "hn_hiring": 20
   },
   "max_per_company": 2,
-  "company_window_days": 30
+  "company_window_days": 30,
+  "max_per_source_day": 8
 }

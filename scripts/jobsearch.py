@@ -378,6 +378,7 @@ def _evaluate(job, P, C, mode="remote"):
     # experience fit (profile.years_experience, default 4)
     mine = P.get("years_experience", 4)
     need = required_years(job["text"])
+    job["_need"], job["_mine"], job["_mode"] = need, mine, mode
     cap_y = P.get("max_required_years", mine + 1)
     if need is not None:
         if need > cap_y:
@@ -773,13 +774,20 @@ class DB:
         CREATE TABLE IF NOT EXISTS alerted(fp TEXT PRIMARY KEY, id TEXT, ts INT, score INT, job TEXT);
         CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);""")
         self.lock = threading.Lock()
-        try:
-            self.c.execute("ALTER TABLE alerted ADD COLUMN ckey TEXT")
-        except sqlite3.OperationalError:
-            pass
+        for col in ("ckey", "src"):
+            try:
+                self.c.execute(f"ALTER TABLE alerted ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
+        for fp, jb in self.c.execute("SELECT fp, job FROM alerted WHERE src IS NULL").fetchall():
+            self.c.execute("UPDATE alerted SET src=? WHERE fp=?", (json.loads(jb)["source"].split(":")[0], fp))
         for fp, jb in self.c.execute("SELECT fp, job FROM alerted WHERE ckey IS NULL").fetchall():
             self.c.execute("UPDATE alerted SET ckey=? WHERE fp=?", (company_key(json.loads(jb)), fp))
         self.c.commit()
+
+    def source_count(self, src, hours=24):
+        with self.lock:
+            return self.c.execute("SELECT COUNT(*) FROM alerted WHERE src=? AND ts>?", (src, time.time() - hours * 3600)).fetchone()[0]
 
     def company_count(self, ck, days):
         with self.lock:
@@ -808,8 +816,8 @@ class DB:
 
     def add_alert(self, fp, job, score):
         with self.lock:
-            self.c.execute("INSERT OR REPLACE INTO alerted(fp,id,ts,score,job,ckey) VALUES(?,?,?,?,?,?)",
-                           (fp, job["id"], int(time.time()), score, json.dumps(job), company_key(job)))
+            self.c.execute("INSERT OR REPLACE INTO alerted(fp,id,ts,score,job,ckey,src) VALUES(?,?,?,?,?,?,?)",
+                           (fp, job["id"], int(time.time()), score, json.dumps(job), company_key(job), job["source"].split(":")[0]))
             self.c.commit()
 
 # ----------------------------------------------------------------- telegram
@@ -843,15 +851,36 @@ def tg_send(cfg, text, url=None):
 def fmt_msg(job, ev):
     e = html.escape
     sal = job.get("_sal")
-    lines = [f"{ev['tier']} <b>{e(job['title'])}</b>",
-             f"🏢 {e(job['company'] or '?')} · 🌍 {e(job['location'] or 'Remote')}" + (f" · {e(job['employment'])}" if job["employment"] else ""),
-             f"💰 {e(fmt_sal(sal))}",
-             f"🕒 posted {when_str(job.get('posted'))}",
-             f"📡 via {e(job['source'].split(':')[0])} · score {ev['score']}",
-             "✔ " + e(" | ".join(ev["reasons"]))]
+    reloc = job.get("_mode") == "reloc"
+    need, mine = job.get("_need"), job.get("_mine", 4)
+    if need is None:
+        exp = "not stated"
+    else:
+        exp = f"{need}+ yrs asked · you ~{mine} " + ("✅" if need <= mine else "⚠️")
+    pretty = []
+    for r in ev["reasons"]:
+        if r.startswith("title~"):
+            r = "Title matches: " + r[6:]
+        elif r.startswith("skills: "):
+            r = "Skills hit: " + r[8:]
+        pretty.append(r[:1].upper() + r[1:])
+    src = job["source"].split(":")[0] + (" · " + job["source"].split(":")[1] if ":" in job["source"] else "")
+    lines = [
+        f"{ev['tier']} <b>{e(job['title'])}</b>",
+        f"🏢 <b>{e(job['company'] or '?')}</b>  ·  " + ("✈️ RELOCATE + VISA" if reloc else "🌍 REMOTE"),
+        "",
+        f"<b>📍 Location:</b> {e(job['location'] or 'Remote')}",
+        f"<b>💼 Type:</b> {e(job['employment'] or 'not stated')}",
+        f"<b>💰 Pay:</b> {e(fmt_sal(sal))}",
+        f"<b>🧠 Experience:</b> {e(exp)}",
+        f"<b>🕒 Posted:</b> {e(when_str(job.get('posted')))}",
+        f"<b>📡 Source:</b> {e(src)}   <b>🎯 Score:</b> {ev['score']}/100",
+        "",
+        "<b>✅ Why it fits</b>",
+    ] + ["• " + e(r) for r in pretty]
     if ev["flags"]:
-        lines.append("⚠ " + e(" | ".join(ev["flags"])))
-    lines.append(f"<code>{e(job['id'])}</code>")
+        lines += ["", "<b>⚠️ Check before applying</b>"] + ["• " + e(f) for f in ev["flags"]]
+    lines += ["", f"<code>{e(job['id'])}</code>"]
     return "\n".join(lines)
 
 
@@ -910,7 +939,7 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=
         cands.append((ev["score"], j, ev))
     st["match"] = len(cands)
     cap, win = C.get("max_per_company", 2), C.get("company_window_days", 30)
-    batch_ck, sent_n = {}, 0
+    batch_ck, batch_src, sent_n = {}, {}, 0
     for _, j, ev in sorted(cands, key=lambda x: -x[0]):
         if sent_n >= C.get("max_alerts_per_cycle", 25):
             break
@@ -919,13 +948,20 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=
             if not dry: db.mark(j["id"])
             log.debug("cap: %s already has %d alerts", ck, cap)
             continue
+        src = j["source"].split(":")[0]
+        scap = C.get("max_per_source_day", 8)
+        if scap and db.source_count(src) + batch_src.get(src, 0) >= scap:
+            if not dry: db.mark(j["id"])
+            log.debug("source cap: %s", src)
+            continue
+        batch_src[src] = batch_src.get(src, 0) + 1
         batch_ck[ck] = batch_ck.get(ck, 0) + 1
         sent_n += 1
         try:
             sink(j, ev)
         except Exception as e:
             log.error("deliver failed %s: %s", j["id"], e)
-            batch_ck[ck] -= 1; sent_n -= 1
+            batch_ck[ck] -= 1; batch_src[src] -= 1; sent_n -= 1
             continue
         if not dry:
             db.mark(j["id"]); db.add_alert(fingerprint(j), j, ev["score"])
