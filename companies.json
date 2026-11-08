@@ -228,7 +228,17 @@
     "gremlin",
     "godaddy",
     "tide",
-    "inter"
+    "inter",
+    "otterai",
+    "protonai",
+    "autogenai",
+    "arizeai",
+    "harnessinc",
+    "lucidsoftware",
+    "gongio",
+    "aptoslabs",
+    "apolloio",
+    "couchbaseinc"
   ],
   "lever": [
     "palantir",
@@ -278,7 +288,8 @@
     "kinsta",
     "spreedly",
     "gojob",
-    "mindful"
+    "mindful",
+    "shieldai"
   ],
   "ashby": [
     "openai",
@@ -475,7 +486,11 @@
     "virtahealth",
     "testgorilla",
     "airgarage",
-    "truelogic"
+    "truelogic",
+    "lumaai",
+    "ironcladhq",
+    "claylabs",
+    "krakentech"
   ],
   "workable": [
     "freelancer",
@@ -504,6 +519,7 @@
     "zignaly",
     "data",
     "bigcartel",
-    "namecheap"
+    "namecheap",
+    "swordtech"
   ]
 }
