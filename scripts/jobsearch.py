@@ -429,8 +429,17 @@ def _evaluate(job, P, C, mode="remote"):
     if sal:
         _, hi_a = sal_annual(sal)
         min_ann = RL.get("min_annual_usd", 110000) if mode == "reloc" else P.get("min_annual_usd", 150000)
-        hourly_ok = mode == "remote" and is_c and hi_a >= P.get("contract_min_annual_usd", 79000)
-        annual_ok = hi_a >= min_ann
+        band = P.get("contract_hourly_band")  # e.g. [35, 37] USD/hr: keeps annual receipts inside the Sec 44ADA limit
+        if mode == "remote" and is_c and band:
+            lo_a2, _ = sal_annual(sal)
+            lo_h, hi_h = lo_a2 / 2080, hi_a / 2080
+            if hi_h < band[0] or lo_h > band[1]:
+                return rej(f"contract rate {fmt_sal(sal)} outside ${band[0]}-{band[1]}/hr band")
+            hourly_ok, annual_ok = True, False
+            reasons.append(f"rate fits ${band[0]}-{band[1]}/hr band")
+        else:
+            hourly_ok = mode == "remote" and is_c and hi_a >= P.get("contract_min_annual_usd", 79000)
+            annual_ok = hi_a >= min_ann
         if not (hourly_ok or annual_ok):
             return rej(f"pay {fmt_sal(sal)} below target")
         score += 25 if (sal["min"] * FX.get(sal["cur"], 1) * PER_MULT[sal["per"]] >= min_ann or hourly_ok) else 15
@@ -442,6 +451,8 @@ def _evaluate(job, P, C, mode="remote"):
         if not (RL.get("allow_unknown_salary", False) if mode == "reloc" else P.get("allow_unknown_salary", True)):
             return rej("salary unlisted")
         flags.append("salary unlisted")
+        if mode == "remote" and is_c and P.get("contract_hourly_band"):
+            flags.append(f"contract: negotiate ${P['contract_hourly_band'][0]}-{P['contract_hourly_band'][1]}/hr")
         tier = "✈️❔" if mode == "reloc" else "❔"
     job["_sal"] = sal
 
