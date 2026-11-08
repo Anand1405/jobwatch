@@ -429,7 +429,7 @@ def _evaluate(job, P, C, mode="remote"):
     if sal:
         _, hi_a = sal_annual(sal)
         min_ann = RL.get("min_annual_usd", 110000) if mode == "reloc" else P.get("min_annual_usd", 150000)
-        hourly_ok = mode == "remote" and is_c and (hi_a / 2080) >= P.get("min_hourly_usd", 50)
+        hourly_ok = mode == "remote" and is_c and hi_a >= P.get("contract_min_annual_usd", 79000)
         annual_ok = hi_a >= min_ann
         if not (hourly_ok or annual_ok):
             return rej(f"pay {fmt_sal(sal)} below target")
