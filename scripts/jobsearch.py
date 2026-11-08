@@ -1137,7 +1137,7 @@ def cmd_discover(a):
     boards = load_json(cf, {})
     tasks = [(k, t) for k, ts in found.items() for t in ts if t not in boards.get(k, [])]
     log.info("discover: probing %d candidate boards", len(tasks))
-    with ThreadPoolExecutor(20) as ex:
+    with ThreadPoolExecutor(48) as ex:
         res = list(ex.map(lambda x: (x[0], x[1], probe_board(*x)), tasks))
     added = {}
     for k, t, n in res:
