@@ -1088,6 +1088,69 @@ def cmd_show(a):
     print(f"{j['title']} @ {j['company']}\n{j['url']}\n{j['location']} | {j['employment']} | {j.get('sal_text')}\n\n{j['text']}")
 
 
+ATS_PATTERNS = {
+    "greenhouse": re.compile(r"(?:boards|job-boards)(?:\.eu)?\.greenhouse\.io/(?:embed/job_board\?for=)?([A-Za-z0-9_-]{2,40})", re.I),
+    "lever": re.compile(r"jobs(?:\.eu)?\.lever\.co/([A-Za-z0-9_-]{2,40})", re.I),
+    "ashby": re.compile(r"jobs\.ashbyhq\.com/([A-Za-z0-9_.-]{2,40})", re.I),
+    "workable": re.compile(r"apply\.workable\.com/([A-Za-z0-9_-]{2,40})", re.I),
+    "recruitee": re.compile(r"https?://([a-z0-9-]{2,40})\.recruitee\.com", re.I),
+}
+ATS_PROBE = {
+    "greenhouse": lambda t: f"https://boards-api.greenhouse.io/v1/boards/{t}/jobs",
+    "lever": lambda t: f"https://api.lever.co/v0/postings/{t}?mode=json",
+    "ashby": lambda t: f"https://api.ashbyhq.com/posting-api/job-board/{t}",
+    "workable": lambda t: f"https://apply.workable.com/api/v1/widget/accounts/{t}",
+    "recruitee": lambda t: f"https://{t}.recruitee.com/api/offers/",
+}
+
+
+def probe_board(kind, token):
+    try:
+        d = http(ATS_PROBE[kind](token), timeout=20)
+        return len(d.get("jobs", d.get("offers", []))) if isinstance(d, dict) else len(d)
+    except Exception:
+        return -1
+
+
+def cmd_discover(a):
+    """Harvest ATS board slugs from every job URL/description we can see + optional candidate file, probe, add live ones."""
+    C, P = load_json(HOME / "config.json", {}), load_json(HOME / "profile.json", {})
+    ctx = Ctx(P, C, lambda x: False)
+    blob = []
+    for name, fn in SOURCES.items():
+        if name == "ats":
+            continue
+        try:
+            for j in fn(ctx):
+                blob.append(f"{j.get('url') or ''} {j.get('text') or ''}")
+        except Exception as e:
+            log.warning("discover %s: %s", name, e)
+    found = {k: set() for k in ATS_PATTERNS}
+    text = "\n".join(blob)
+    for kind, rx in ATS_PATTERNS.items():
+        found[kind] |= {m.lower() for m in rx.findall(text)}
+    if a.candidates:
+        for line in Path(a.candidates).read_text(encoding="utf-8").split():
+            for kind in ATS_PATTERNS:
+                found[kind].add(line.strip().lower())
+    cf = HOME / "companies.json"
+    boards = load_json(cf, {})
+    tasks = [(k, t) for k, ts in found.items() for t in ts if t not in boards.get(k, [])]
+    log.info("discover: probing %d candidate boards", len(tasks))
+    with ThreadPoolExecutor(20) as ex:
+        res = list(ex.map(lambda x: (x[0], x[1], probe_board(*x)), tasks))
+    added = {}
+    for k, t, n in res:
+        if n > 0:
+            boards.setdefault(k, []).append(t)
+            added.setdefault(k, []).append(f"{t}({n})")
+    for k, v in added.items():
+        print(f"+{len(v)} {k}: {', '.join(v)}")
+    if not a.dry_run:
+        cf.write_text(json.dumps(boards, indent=2), encoding="utf-8")
+    print({k: len(v) for k, v in boards.items() if isinstance(v, list)})
+
+
 def cmd_tg_chat_id(a):
     C = load_json(HOME / "config.json", {})
     r = tg_call(C, "getUpdates", {})
@@ -1116,6 +1179,7 @@ def main():
     r.add_argument("--backfill", action="store_true", help="re-evaluate already-seen jobs (use with --max-age-min)")
     i = sp.add_parser("ingest"); i.set_defaults(fn=cmd_ingest)
     i.add_argument("file"); i.add_argument("--label", default="sweep"); i.add_argument("--dry-run", action="store_true")
+    d = sp.add_parser("discover"); d.set_defaults(fn=cmd_discover); d.add_argument("--candidates"); d.add_argument("--dry-run", action="store_true")
     s = sp.add_parser("show"); s.set_defaults(fn=cmd_show); s.add_argument("id")
     a = ap.parse_args()
     a.fn(a)
