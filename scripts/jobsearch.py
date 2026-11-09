@@ -1114,7 +1114,6 @@ def is_live(job):
     return not DEAD_PAT.search(clean(body)[:6000])
 
 
-LLM_MODEL = "claude-haiku-5-5"
 _ENUM = lambda *v: {"type": "string", "enum": list(v)}
 _NUM = lambda t="number": {"type": [t, "null"]}
 EXTRACT_TOOL = {
@@ -1151,11 +1150,11 @@ EXTRACT_TOOL = {
 }
 
 
-def llm_extract(job, P):
-    """One Haiku call -> all structured facts about the posting. None on no key / error (rules take over)."""
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        return None
+def llm_enabled():
+    return bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"))
+
+
+def _prompts(job, P):
     me = ", ".join(P.get("target_titles", [])[:12])
     skills = ", ".join(P.get("skills", [])[:25])
     system = (
@@ -1173,7 +1172,89 @@ def llm_extract(job, P):
         f"skills: {skills}. 9-10 = near-perfect GenAI/LLM/agent/ML engineering role; 5-6 = adjacent; below 5 = different field or wrong level.")
     user = (f"TITLE: {job['title']}\nCOMPANY: {job['company']}\nLOCATION: {job['location']}\nEMPLOYMENT: {job['employment']}\n"
             f"SALARY TEXT: {job['sal_text']}\nMETADATA: {job.get('meta', '')}\nDESCRIPTION:\n{job['text'][:7000]}")
-    body = {"model": LLM_MODEL, "max_tokens": 900, "system": system, "tools": [EXTRACT_TOOL],
+    return system, user
+
+
+def _to_gemini(sc):
+    """JSON-Schema subset -> Gemini responseSchema."""
+    t = sc.get("type")
+    nullable = isinstance(t, list) and "null" in t
+    if isinstance(t, list):
+        t = [x for x in t if x != "null"][0]
+    out = {"type": t.upper()}
+    if nullable:
+        out["nullable"] = True
+    if "enum" in sc:
+        out["enum"] = [e for e in sc["enum"] if e is not None]
+    if t == "object":
+        out["properties"] = {k: _to_gemini(v) for k, v in sc["properties"].items()}
+        out["required"] = [r for r in sc["required"]]
+    if t == "array":
+        out["items"] = _to_gemini(sc["items"])
+    return out
+
+
+_GEM_MODEL = {}
+
+
+def _gemini_model(key):
+    """Pick the newest 'flash-lite' (else 'flash') model this key can call; config llm_model overrides."""
+    if _GEM_MODEL.get("m"):
+        return _GEM_MODEL["m"]
+    m = os.environ.get("GEMINI_MODEL")
+    if not m:
+        try:
+            d = http("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", {"x-goog-api-key": key}, timeout=30)
+            names = [x["name"].split("/")[-1] for x in d.get("models", [])
+                     if "generateContent" in x.get("supportedGenerationMethods", [])]
+            bad = re.compile(r"image|tts|live|embed|audio|vision|robotics|thinking|exp|preview|latest|customtools|computer", re.I)
+            def ver(n):
+                v = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+                return float(v.group(1)) if v else 0.0
+            for kind in ("flash-lite", "flash"):
+                cands = sorted([n for n in names if kind in n and not bad.search(n) and (kind == "flash-lite" or "lite" not in n)], key=lambda n: (-ver(n), len(n)))
+                if cands:
+                    m = cands[0]
+                    break
+        except Exception as e:
+            log.warning("gemini model list failed: %s", str(e)[:120])
+    _GEM_MODEL["m"] = m or "gemini-2.5-flash-lite"
+    log.info("gemini model: %s", _GEM_MODEL["m"])
+    return _GEM_MODEL["m"]
+
+
+def _gemini_extract(job, P, key):
+    system, user = _prompts(job, P)
+    model = _gemini_model(key)
+    cfg = {"responseMimeType": "application/json", "responseSchema": _to_gemini(EXTRACT_TOOL["input_schema"]),
+           "temperature": 0, "maxOutputTokens": 1200}
+    body = {"systemInstruction": {"parts": [{"text": system}]}, "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": cfg}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    hdr = {"x-goog-api-key": key, "content-type": "application/json"}
+    for think in (True, False):  # first try with thinking off (cheaper/faster); retry plain if the model rejects it
+        if think:
+            cfg["thinkingConfig"] = {"thinkingBudget": 0}
+        else:
+            cfg.pop("thinkingConfig", None)
+        try:
+            r = http(url, hdr, json.dumps(body).encode(), timeout=60)
+            parts = r["candidates"][0]["content"]["parts"]
+            return json.loads("".join(p.get("text", "") for p in parts))
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and think:
+                continue
+            log.warning("gemini extract failed: HTTP %s", e.code)
+            return None
+        except Exception as e:
+            log.warning("gemini extract failed: %s", str(e)[:140])
+            return None
+    return None
+
+
+def _anthropic_extract(job, P, key):
+    system, user = _prompts(job, P)
+    body = {"model": "claude-haiku-5-5", "max_tokens": 900, "system": system, "tools": [EXTRACT_TOOL],
             "tool_choice": {"type": "tool", "name": "record_job"}, "messages": [{"role": "user", "content": user}]}
     try:
         r = http("https://api.anthropic.com/v1/messages", {"x-api-key": key, "anthropic-version": "2023-06-01",
@@ -1182,8 +1263,17 @@ def llm_extract(job, P):
             if blk.get("type") == "tool_use":
                 return blk["input"]
     except Exception as e:
-        log.warning("llm_extract failed: %s", str(e)[:160])
+        log.warning("anthropic extract failed: %s", str(e)[:140])
     return None
+
+
+def llm_extract(job, P):
+    """One small-model call -> all structured facts about the posting. Gemini first, else Anthropic. None -> rules take over."""
+    gk = os.environ.get("GEMINI_API_KEY")
+    if gk:
+        return _gemini_extract(job, P, gk)
+    ak = os.environ.get("ANTHROPIC_API_KEY")
+    return _anthropic_extract(job, P, ak) if ak else None
 
 
 def title_ok(job, P):
@@ -1345,7 +1435,7 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=
             if not dry: db.mark(j["id"])
             continue
         ev = None
-        if os.environ.get("ANTHROPIC_API_KEY") and llm_candidate(j, P):
+        if llm_enabled() and llm_candidate(j, P):
             x = db.llm_get(j["id"])
             if x is None:
                 if llm_calls >= C.get("max_llm_per_cycle", 60):
