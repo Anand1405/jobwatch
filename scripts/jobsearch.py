@@ -93,8 +93,8 @@ def to_epoch(v):
     return iso_epoch(v)
 
 
-def J(source, jid, title, company, url, posted, location="", remote=None, employment="", text="", sal=None, sal_text=""):
-    return dict(source=source, id=f"{source}:{jid}", title=(title or "").strip(), company=(company or "").strip(),
+def J(source, jid, title, company, url, posted, location="", remote=None, employment="", text="", sal=None, sal_text="", meta=""):
+    return dict(meta=(meta or "")[:600], source=source, id=f"{source}:{jid}", title=(title or "").strip(), company=(company or "").strip(),
                 url=url, posted=posted, location=(location or "").strip(), remote=remote,
                 employment=(employment or "").lower(), text=(text or "")[:8000], sal=sal, sal_text=sal_text or "")
 
@@ -387,7 +387,7 @@ def _evaluate(job, P, C, mode="remote"):
             return rej(geo_label)
     else:
         txt = job["text"][:8000]
-        sig, evid = sponsorship_signal(job["text"])
+        sig, evid = sponsorship_signal(job["title"] + ".\n" + job.get("meta", "") + ".\n" + job["text"])
         if sig == "no":
             return rej("sponsorship explicitly not offered")
         if sig != "yes":
@@ -646,7 +646,7 @@ def f_arbeitnow(ctx):
         loc = r.get("location") or ""
         j = J("arbeitnow", r["slug"], r.get("title"), r.get("company_name"), r.get("url"), to_epoch(r.get("created_at")),
               loc or "Germany", bool(r.get("remote")), ", ".join(r.get("job_types") or []),
-              clean(r.get("description")) + " " + " ".join(r.get("tags") or []))
+              clean(r.get("description")), meta=" . ".join((r.get("tags") or []) + (r.get("job_types") or [])))
         out.append(j)
     return out
 
@@ -854,7 +854,7 @@ LI_DEFAULT_Q = ["AI Engineer", "Generative AI Engineer", "LLM Engineer", "Machin
 
 def _li_search(q, geoid, remote, window_s, extra=""):
     import urllib.parse as up
-    params = {"keywords": (q + " " + extra).strip(), "geoId": geoid, "f_TPR": f"r{window_s}", "start": 0}
+    params = {"keywords": (q + " " + extra).strip(), "geoId": geoid, "f_TPR": f"r{window_s}", "sortBy": "DD", "start": 0}
     if remote:
         params["f_WT"] = 2
     h = http(f"{LI_BASE}/seeMoreJobPostings/search?" + up.urlencode(params), LI_HDR, raw=True).decode("utf-8", "replace")
@@ -873,8 +873,8 @@ def f_linkedin(ctx):
     """LinkedIn public (guest) job search - no login. Freshness via f_TPR window; detail page for JD."""
     P, C = ctx.P, ctx.C
     qs = P.get("linkedin_queries") or LI_DEFAULT_Q
-    window = int(C.get("linkedin_window_min", 180)) * 60
-    searches = [(q, "92000000", True, "") for q in qs] + [(q, "102713980", True, "") for q in qs[:6]]
+    window = int(C.get("linkedin_window_min", 1440)) * 60
+    searches = [(q, "92000000", True, "") for q in qs] + [(q, "102713980", True, "") for q in qs[:4]]
     if (P.get("relocation") or {}).get("enabled"):
         searches += [(q, "92000000", False, "visa sponsorship") for q in qs[:5]]
     cards, seen_ids = [], set()
@@ -890,7 +890,7 @@ def f_linkedin(ctx):
             if jid not in seen_ids:
                 seen_ids.add(jid)
                 cards.append((jid, title, comp, loc, remote, bool(extra)))
-        time.sleep(0.4)
+        time.sleep(1.0)
     out = []
     for jid, title, comp, loc, remote, sponsor in cards:
         full = f"linkedin:{jid}"
@@ -909,7 +909,8 @@ def f_linkedin(ctx):
         j = J("linkedin", jid, title, comp, f"https://www.linkedin.com/jobs/view/{jid}", None, loc,
               True if remote else None, crit.get("Employment type", ""), clean(desc.group(1)) if desc else "", None,
               clean(sal.group(1)) if sal else "")
-        j["posted_text"] = f"within last {int(window / 60)} min window (LinkedIn)"
+        j["meta"] = " . ".join(f"{k}: {v}" for k, v in crit.items())[:600]
+        j["posted_text"] = f"within last {int(window / 3600)} h window (LinkedIn)"
         if sponsor:
             out.append(j)
         time.sleep(0.3)
@@ -1032,7 +1033,7 @@ def fmt_msg(job, ev):
         f"<b>🧠 Experience:</b> {e(exp)}",
         *([f"<b>🛂 Visa/relocation (from JD):</b> “{e(job['_visa'])}”"] if reloc and job.get("_visa") else []),
         f"<b>🕒 Posted:</b> {e(when_str(job.get('posted'), job.get('posted_text', '')))}",
-        f"<b>📡 Source:</b> {e(src)}   <b>🎯 Score:</b> {ev['score']}/100",
+        f"<b>📡 Source:</b> {e(src)}   <b>🎯 Score:</b> {ev['score']}/100" + ("   🤖 AI-verified" if job.get("_verified") else ""),
         "",
         "<b>✅ Why it fits</b>",
     ] + ["• " + e(r) for r in pretty]
@@ -1094,6 +1095,35 @@ def is_live(job):
     return not DEAD_PAT.search(clean(body)[:6000])
 
 
+LLM_MODEL = "claude-haiku-5-5"
+
+
+def llm_verify(job, P, mode):
+    """Small-model second opinion on a job that already passed the rules. None if no key/err (rules stand)."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        return None
+    prompt = (
+        f"Candidate: software engineer in India, about {P.get('years_experience', 4)} years experience. Wants EITHER (a) a remote job that "
+        "a person living in India may take, OR (b) a foreign job whose posting itself offers visa sponsorship / work permit support.\n"
+        "Use ONLY the posting text below. Never guess from the company's reputation. Title and metadata count as posting text.\n"
+        'Reply with ONLY this JSON: {"visa_sponsorship":"offered|not_offered|unknown","visa_evidence":"short exact quote or empty",'
+        '"india_remote_eligible":"yes|no|unclear","geo_evidence":"short exact quote or empty","min_years_experience":null,"contract_months":null}\n'
+        "- visa_sponsorship=offered only if the text says sponsorship/work-permit support is provided; not_offered if it says no/unable/must already have right to work.\n"
+        "- india_remote_eligible=no if the role is limited to other countries/regions or needs local work authorization; yes if worldwide/anywhere/India/APAC is stated.\n\n"
+        f"TITLE: {job['title']}\nCOMPANY: {job['company']}\nLOCATION: {job['location']}\nEMPLOYMENT: {job['employment']}\n"
+        f"METADATA: {job.get('meta', '')}\nDESCRIPTION: {job['text'][:6500]}")
+    body = {"model": LLM_MODEL, "max_tokens": 350, "messages": [{"role": "user", "content": prompt}]}
+    try:
+        r = http("https://api.anthropic.com/v1/messages", {"x-api-key": key, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"}, json.dumps(body).encode(), timeout=45)
+        m = re.search(r"\{.*\}", r["content"][0]["text"], re.S)
+        return json.loads(m.group(0)) if m else None
+    except Exception as e:
+        log.warning("llm_verify failed: %s", str(e)[:120])
+        return None
+
+
 def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=False):
     """Evaluate unseen jobs; sink(job, ev) delivers. Returns stats."""
     st = dict(new=0, match=0, sent=0)
@@ -1121,7 +1151,7 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=
         cands.append((ev["score"], j, ev))
     st["match"] = len(cands)
     cap, win = C.get("max_per_company", 2), C.get("company_window_days", 30)
-    batch_ck, batch_src, sent_n = {}, {}, 0
+    batch_ck, batch_src, sent_n, llm_calls = {}, {}, 0, 0
     for _, j, ev in sorted(cands, key=lambda x: -x[0]):
         if sent_n >= C.get("max_alerts_per_cycle", 25):
             break
@@ -1129,6 +1159,27 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=
             if not dry: db.mark(j["id"])
             log.info("dead posting skipped: %s", j["url"])
             continue
+        v = llm_verify(j, P, j.get("_mode", "remote")) if llm_calls < C.get("max_llm_per_cycle", 25) else None
+        if v is not None:
+            llm_calls += 1
+            if j.get("_mode") == "reloc" and v.get("visa_sponsorship") != "offered":
+                if not dry: db.mark(j["id"])
+                log.info("model rejected (visa %s): %s", v.get("visa_sponsorship"), j["title"])
+                continue
+            if j.get("_mode") != "reloc" and v.get("india_remote_eligible") == "no":
+                if not dry: db.mark(j["id"])
+                log.info("model rejected (not India-eligible): %s", j["title"])
+                continue
+            my = v.get("min_years_experience")
+            if isinstance(my, int) and my > P.get("max_required_years", j.get("_mine", 4) + 1):
+                if not dry: db.mark(j["id"])
+                log.info("model rejected (%s+ yrs): %s", my, j["title"])
+                continue
+            if isinstance(my, int) and j.get("_need") is None:
+                j["_need"] = my
+            if v.get("visa_evidence") and j.get("_mode") == "reloc":
+                j["_visa"] = v["visa_evidence"][:170]
+            j["_verified"] = True
         ck = company_key(j)
         if ck and cap and db.company_count(ck, win) + batch_ck.get(ck, 0) >= cap:
             if not dry: db.mark(j["id"])

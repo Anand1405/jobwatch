@@ -26,6 +26,7 @@ jobs:
       JOBSEARCH_TG_TOKEN: ${{ secrets.TG_TOKEN }}
       JOBSEARCH_TG_CHAT: ${{ secrets.TG_CHAT }}
       PROFILE_JSON: ${{ secrets.PROFILE_JSON }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - name: Restore state
