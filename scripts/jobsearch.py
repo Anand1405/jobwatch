@@ -297,12 +297,35 @@ def contract_info(job):
     return True, best
 
 # ----------------------------------------------------------------- scoring
-SPONSOR_POS = re.compile(r"visa sponsor|sponsor(?:s|ship)?(?: a| your)?(?: work)? visa|we (?:will |can )?sponsor|sponsorship (?:is )?(?:available|provided|offered)|"
-                         r"relocation (?:assistance|package|support|bonus|allowance|budget)|relocat\w+ (?:to|support|assistance)|blue card|skilled worker visa|"
-                         r"h-?1b (?:sponsor|transfer)|work permit (?:support|sponsor|provided)|global talent|tech\.?pass|employment pass|visa support|immigration support", re.I)
-SPONSOR_NEG = re.compile(r"no (?:visa )?sponsorship|(?:unable|not able|cannot|can't|won't|will not|do not|don't|does not) (?:to )?(?:offer |provide )?(?:visa )?sponsor|"
-                         r"without (?:visa )?sponsorship|sponsorship (?:is )?not (?:available|offered|provided)|must (?:already )?(?:have|hold) (?:the )?(?:right|work authori)|"
-                         r"no relocation", re.I)
+VISA_WORDS = re.compile(r"visa|sponsor|work permit|work authori[sz]ation|immigration|right to work|blue card|relocat", re.I)
+NEG_WORDS = re.compile(r"\b(?:no|not|never|cannot|can't|unable|without|unfortunately|unavailable|ineligible|neither|nor|won't|don't|doesn't|isn't|aren't)\b|"
+                       r"n't\b|\bmust (?:already )?(?:have|hold|possess|be (?:legally )?(?:authori[sz]ed|eligible|entitled))|"
+                       r"\b(?:authori[sz]ed|eligible|entitled|permitted) to work\b|\bright to work\b|\bcurrently (?:hold|have)\b|\bonly (?:candidates|applicants)\b", re.I)
+POS_WORDS = re.compile(r"(?:provide|provides|providing|offer|offers|offering|support|supports|supporting|sponsor|sponsors|sponsoring|assist|assists|assistance|help|helps|"
+                       r"available|covered|cover|covers)\b.{0,40}?\b(?:visa|work permit|relocation|immigration|sponsorship)|"
+                       r"(?:visa|work permit|sponsorship|relocation)\b.{0,25}?\b(?:available|provided|offered|supported|assistance|support|package|bonus|allowance|stipend|budget)\b|"
+                       r"\bwe (?:will |can |do |are able to |are happy to )?sponsor\b|\bblue card\b|\bvisa support\b|\bimmigration support\b", re.I)
+
+
+def sponsorship_signal(text):
+    """Sentence-level read of a JD -> ('yes'|'no'|'none', evidence quote). Never guesses from absence."""
+    pos = neg = None
+    for sent in re.split(r"(?<=[.!?;])\s+|\n+|[•·]", text or ""):
+        sent = sent.strip()
+        if len(sent) < 12 or sent.endswith("?") or not VISA_WORDS.search(sent):
+            continue  # skip form-style questions like "Available for Work Visa Sponsorship?"
+        has_visa = re.search(r"visa|sponsor|work permit|work authori[sz]ation|immigration|right to work", sent, re.I)
+        if has_visa and NEG_WORDS.search(sent):
+            neg = neg or sent[:170]
+        elif POS_WORDS.search(sent) and re.search(r"visa|sponsor|work permit|immigration|blue card", sent, re.I):
+            pos = pos or sent[:170]  # relocation money alone is not a visa promise
+    if neg:
+        return "no", neg
+    if pos:
+        return "yes", pos
+    return "none", ""
+
+
 REMOTE_REJECTS = ("geo-restricted", "location:", "not remote", "remote not stated", "excludes India")
 
 
@@ -364,10 +387,12 @@ def _evaluate(job, P, C, mode="remote"):
             return rej(geo_label)
     else:
         txt = job["text"][:8000]
-        if SPONSOR_NEG.search(txt):
-            return rej("no sponsorship")
-        if not (job.get("sponsor") or SPONSOR_POS.search(txt)):
-            return rej("no visa/relocation signal")
+        sig, evid = sponsorship_signal(job["text"])
+        if sig == "no":
+            return rej("sponsorship explicitly not offered")
+        if sig != "yes":
+            return rej("no visa/relocation mention in JD")
+        job["_visa"] = evid
         cs = [c.lower() for c in RL.get("countries", [])]
         loc_l = (job["location"] + " " + txt[:300]).lower()
         if cs and not any(c in loc_l for c in cs):
@@ -622,7 +647,6 @@ def f_arbeitnow(ctx):
         j = J("arbeitnow", r["slug"], r.get("title"), r.get("company_name"), r.get("url"), to_epoch(r.get("created_at")),
               loc or "Germany", bool(r.get("remote")), ", ".join(r.get("job_types") or []),
               clean(r.get("description")) + " " + " ".join(r.get("tags") or []))
-        j["sponsor"] = True
         out.append(j)
     return out
 
@@ -876,6 +900,8 @@ def f_linkedin(ctx):
             d = http(f"{LI_BASE}/jobPosting/{jid}", LI_HDR, raw=True).decode("utf-8", "replace")
         except Exception:
             continue
+        if re.search(r"no longer accepting applications|closed-job|job is no longer available", d, re.I):
+            continue
         desc = re.search(r'show-more-less-html__markup[^>]*>(.*?)</div>', d, re.S)
         crit = dict((clean(a), clean(b)) for a, b in re.findall(
             r'description__job-criteria-subheader">\s*(.*?)\s*</h3>.*?description__job-criteria-text[^>]*>\s*(.*?)\s*</span>', d, re.S))
@@ -885,8 +911,7 @@ def f_linkedin(ctx):
               clean(sal.group(1)) if sal else "")
         j["posted_text"] = f"within last {int(window / 60)} min window (LinkedIn)"
         if sponsor:
-            j["sponsor"] = True
-        out.append(j)
+            out.append(j)
         time.sleep(0.3)
     return out
 
@@ -991,6 +1016,8 @@ def fmt_msg(job, ev):
     for r in ev["reasons"]:
         if r.startswith("title~"):
             r = "Title matches: " + r[6:]
+        elif r.startswith("visa/relocation support"):
+            continue
         elif r.startswith("skills: "):
             r = "Skills hit: " + r[8:]
         pretty.append(r[:1].upper() + r[1:])
@@ -1003,6 +1030,7 @@ def fmt_msg(job, ev):
         f"<b>💼 Type:</b> {e(job['employment'] or 'not stated')}",
         f"<b>💰 Pay:</b> {e(fmt_sal(sal))}",
         f"<b>🧠 Experience:</b> {e(exp)}",
+        *([f"<b>🛂 Visa/relocation (from JD):</b> “{e(job['_visa'])}”"] if reloc and job.get("_visa") else []),
         f"<b>🕒 Posted:</b> {e(when_str(job.get('posted'), job.get('posted_text', '')))}",
         f"<b>📡 Source:</b> {e(src)}   <b>🎯 Score:</b> {ev['score']}/100",
         "",
@@ -1042,6 +1070,30 @@ def cmd_init(a=None):
     print("\nNext: edit config.json (telegram), profile.json (from resume), then `jobsearch.py tg-test` and `jobsearch.py run --dry-run`")
 
 # ----------------------------------------------------------------- pipeline
+DEAD_PAT = re.compile(r"no longer accepting applications|no longer available|no longer open|job (?:has )?expired|this job has expired|"
+                      r"position (?:has been|is) (?:filled|closed)|posting (?:is|has been) closed|job (?:is )?closed|job not found|"
+                      r"page not found|has been closed|this position is no longer|not currently accepting|vacancy (?:has been|is) closed|"
+                      r"this job is closed|job posting (?:is )?(?:closed|expired)", re.I)
+
+
+def is_live(job):
+    """True unless the posting page clearly says closed/expired/404. Unknown/blocked -> assume live."""
+    if job["source"].startswith("linkedin") or not (job.get("url") or "").startswith("http"):
+        return True
+    try:
+        req = urllib.request.Request(job["url"], headers={"User-Agent": UA, "Accept": "text/html,*/*"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            final = r.geturl().lower()
+            body = r.read(400_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code not in (404, 410)
+    except Exception:
+        return True
+    if "error=true" in final or final.rstrip("/").endswith(("/jobs", "/careers")):
+        return False
+    return not DEAD_PAT.search(clean(body)[:6000])
+
+
 def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=False):
     """Evaluate unseen jobs; sink(job, ev) delivers. Returns stats."""
     st = dict(new=0, match=0, sent=0)
@@ -1073,6 +1125,10 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=
     for _, j, ev in sorted(cands, key=lambda x: -x[0]):
         if sent_n >= C.get("max_alerts_per_cycle", 25):
             break
+        if not is_live(j):
+            if not dry: db.mark(j["id"])
+            log.info("dead posting skipped: %s", j["url"])
+            continue
         ck = company_key(j)
         if ck and cap and db.company_count(ck, win) + batch_ck.get(ck, 0) >= cap:
             if not dry: db.mark(j["id"])
