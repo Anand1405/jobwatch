@@ -8,6 +8,9 @@ on:
       backfill_hours:
         description: Re-send matches from the last N hours (0 = normal run)
         default: '0'
+      reset_state:
+        description: Forget everything already sent (true/false)
+        default: 'false'
 concurrency:
   group: job-search
   cancel-in-progress: false
@@ -26,6 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Restore state
+        if: github.event.inputs.reset_state != 'true'
         uses: actions/cache/restore@v4
         with:
           path: /home/runner/.job-search/state.sqlite
