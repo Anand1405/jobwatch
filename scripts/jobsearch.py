@@ -928,7 +928,8 @@ class DB:
         self.c = sqlite3.connect(HOME / "state.sqlite", check_same_thread=False)
         self.c.executescript("""CREATE TABLE IF NOT EXISTS seen(id TEXT PRIMARY KEY, ts INT);
         CREATE TABLE IF NOT EXISTS alerted(fp TEXT PRIMARY KEY, id TEXT, ts INT, score INT, job TEXT);
-        CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);""")
+        CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE IF NOT EXISTS llm(id TEXT PRIMARY KEY, ts INT, j TEXT);""")
         self.lock = threading.Lock()
         for col in ("ckey", "src"):
             try:
@@ -948,6 +949,16 @@ class DB:
     def company_count(self, ck, days):
         with self.lock:
             return self.c.execute("SELECT COUNT(*) FROM alerted WHERE ckey=? AND ts>?", (ck, time.time() - days * 86400)).fetchone()[0]
+
+    def llm_get(self, jid):
+        with self.lock:
+            r = self.c.execute("SELECT j FROM llm WHERE id=?", (jid,)).fetchone()
+        return json.loads(r[0]) if r else None
+
+    def llm_put(self, jid, x):
+        with self.lock:
+            self.c.execute("INSERT OR REPLACE INTO llm VALUES(?,?,?)", (jid, int(time.time()), json.dumps(x)))
+            self.c.commit()
 
     def seen(self, jid):
         with self.lock:
@@ -1033,12 +1044,20 @@ def fmt_msg(job, ev):
         f"<b>🧠 Experience:</b> {e(exp)}",
         *([f"<b>🛂 Visa/relocation (from JD):</b> “{e(job['_visa'])}”"] if reloc and job.get("_visa") else []),
         f"<b>🕒 Posted:</b> {e(when_str(job.get('posted'), job.get('posted_text', '')))}",
-        f"<b>📡 Source:</b> {e(src)}   <b>🎯 Score:</b> {ev['score']}/100" + ("   🤖 AI-verified" if job.get("_verified") else ""),
+        f"<b>📡 Source:</b> {e(src)}   <b>🎯 Score:</b> {ev['score']}/100" + ("   🤖 AI-extracted" if job.get("_x") else ""),
         "",
         "<b>✅ Why it fits</b>",
     ] + ["• " + e(r) for r in pretty]
     if ev["flags"]:
         lines += ["", "<b>⚠️ Check before applying</b>"] + ["• " + e(f) for f in ev["flags"]]
+    x = job.get("_x")
+    if x:
+        if x.get("summary"):
+            lines += ["", f"<b>📝 Summary:</b> {e(x['summary'][:260])}"]
+        if x.get("key_requirements"):
+            lines += [f"<b>🔑 Needs:</b> {e(' · '.join(r[:60] for r in x['key_requirements'][:5]))}"]
+        if x.get("seniority") not in (None, "unknown"):
+            lines += [f"<b>🎚 Level:</b> {e(x['seniority'].replace('_', ' '))}"]
     lines += ["", f"<code>{e(job['id'])}</code>"]
     return "\n".join(lines)
 
@@ -1096,38 +1115,228 @@ def is_live(job):
 
 
 LLM_MODEL = "claude-haiku-5-5"
+_ENUM = lambda *v: {"type": "string", "enum": list(v)}
+_NUM = lambda t="number": {"type": [t, "null"]}
+EXTRACT_TOOL = {
+    "name": "record_job",
+    "description": "Record structured facts extracted from one job posting. Use only what the posting text says.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "is_remote": _ENUM("remote", "hybrid", "onsite", "unclear"),
+            "remote_scope": _ENUM("worldwide", "apac_or_india", "region_restricted", "country_restricted", "unclear"),
+            "india_eligible": _ENUM("yes", "no", "unclear"),
+            "geo_evidence": {"type": "string"},
+            "visa_sponsorship": _ENUM("offered", "not_offered", "not_mentioned"),
+            "visa_evidence": {"type": "string"},
+            "relocation_support": _ENUM("offered", "not_offered", "not_mentioned"),
+            "employment_type": _ENUM("full_time", "contract", "freelance", "part_time", "internship", "unknown"),
+            "contract_months": _NUM("integer"),
+            "min_years_experience": _NUM("integer"),
+            "salary_min": _NUM(), "salary_max": _NUM(),
+            "salary_currency": {"type": ["string", "null"]},
+            "salary_period": {"type": ["string", "null"], "enum": ["hour", "day", "week", "month", "year", None]},
+            "seniority": _ENUM("junior", "mid", "senior", "staff_plus", "unknown"),
+            "role_fit": {"type": "integer", "minimum": 0, "maximum": 10},
+            "role_fit_reason": {"type": "string"},
+            "posting_status": _ENUM("open", "closed", "unknown"),
+            "summary": {"type": "string"},
+            "key_requirements": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+        },
+        "required": ["is_remote", "remote_scope", "india_eligible", "geo_evidence", "visa_sponsorship", "visa_evidence",
+                     "relocation_support", "employment_type", "contract_months", "min_years_experience", "salary_min", "salary_max",
+                     "salary_currency", "salary_period", "seniority", "role_fit", "role_fit_reason", "posting_status", "summary",
+                     "key_requirements"],
+    },
+}
 
 
-def llm_verify(job, P, mode):
-    """Small-model second opinion on a job that already passed the rules. None if no key/err (rules stand)."""
+def llm_extract(job, P):
+    """One Haiku call -> all structured facts about the posting. None on no key / error (rules take over)."""
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         return None
-    prompt = (
-        f"Candidate: software engineer in India, about {P.get('years_experience', 4)} years experience. Wants EITHER (a) a remote job that "
-        "a person living in India may take, OR (b) a foreign job whose posting itself offers visa sponsorship / work permit support.\n"
-        "Use ONLY the posting text below. Never guess from the company's reputation. Title and metadata count as posting text.\n"
-        'Reply with ONLY this JSON: {"visa_sponsorship":"offered|not_offered|unknown","visa_evidence":"short exact quote or empty",'
-        '"india_remote_eligible":"yes|no|unclear","geo_evidence":"short exact quote or empty","min_years_experience":null,"contract_months":null}\n'
-        "- visa_sponsorship=offered only if the text says sponsorship/work-permit support is provided; not_offered if it says no/unable/must already have right to work.\n"
-        "- india_remote_eligible=no if the role is limited to other countries/regions or needs local work authorization; yes if worldwide/anywhere/India/APAC is stated.\n\n"
-        f"TITLE: {job['title']}\nCOMPANY: {job['company']}\nLOCATION: {job['location']}\nEMPLOYMENT: {job['employment']}\n"
-        f"METADATA: {job.get('meta', '')}\nDESCRIPTION: {job['text'][:6500]}")
-    body = {"model": LLM_MODEL, "max_tokens": 350, "messages": [{"role": "user", "content": prompt}]}
+    me = ", ".join(P.get("target_titles", [])[:12])
+    skills = ", ".join(P.get("skills", [])[:25])
+    system = (
+        "You extract facts from job postings for ONE candidate. Use ONLY the posting text (title, metadata, description); never guess from the "
+        "company's reputation. Quote evidence verbatim and short. Rules:\n"
+        "- india_eligible: yes only if the posting says worldwide/anywhere/global/India/APAC or a timezone India fits; no if it names only other "
+        "countries/regions or demands local work authorization; unclear otherwise.\n"
+        "- visa_sponsorship: offered only if the posting itself says visa/work-permit sponsorship or support is provided; not_offered if it says "
+        "no/unable/must already have the right to work; else not_mentioned. A relocation bonus alone is NOT visa sponsorship.\n"
+        "- salary: numbers exactly as written, ISO currency (INR for rupees; convert LPA/lakh to rupees per year), period hour/day/week/month/year.\n"
+        "- min_years_experience: the largest 'N+ years' requirement for the role overall (null if none stated).\n"
+        "- contract_months: stated contract duration in months (null if not stated or not a contract).\n"
+        "- posting_status: closed only if the text says it is closed/filled/no longer accepting applications.\n"
+        f"- role_fit 0-10: how well the job matches the candidate. Candidate: about {P.get('years_experience', 4)} years experience; target roles: {me}; "
+        f"skills: {skills}. 9-10 = near-perfect GenAI/LLM/agent/ML engineering role; 5-6 = adjacent; below 5 = different field or wrong level.")
+    user = (f"TITLE: {job['title']}\nCOMPANY: {job['company']}\nLOCATION: {job['location']}\nEMPLOYMENT: {job['employment']}\n"
+            f"SALARY TEXT: {job['sal_text']}\nMETADATA: {job.get('meta', '')}\nDESCRIPTION:\n{job['text'][:7000]}")
+    body = {"model": LLM_MODEL, "max_tokens": 900, "system": system, "tools": [EXTRACT_TOOL],
+            "tool_choice": {"type": "tool", "name": "record_job"}, "messages": [{"role": "user", "content": user}]}
     try:
         r = http("https://api.anthropic.com/v1/messages", {"x-api-key": key, "anthropic-version": "2023-06-01",
-                 "content-type": "application/json"}, json.dumps(body).encode(), timeout=45)
-        m = re.search(r"\{.*\}", r["content"][0]["text"], re.S)
-        return json.loads(m.group(0)) if m else None
+                 "content-type": "application/json"}, json.dumps(body).encode(), timeout=60)
+        for blk in r.get("content", []):
+            if blk.get("type") == "tool_use":
+                return blk["input"]
     except Exception as e:
-        log.warning("llm_verify failed: %s", str(e)[:120])
-        return None
+        log.warning("llm_extract failed: %s", str(e)[:160])
+    return None
+
+
+def title_ok(job, P):
+    tl = job["title"].lower()
+    for w in P.get("exclude_title_words", []):
+        if re.search(r"(?<![\w])" + re.escape(w.lower()) + r"(?![\w])", tl):
+            return False
+    return any(set(tokens(t)) <= set(tokens(job["title"])) for t in P.get("target_titles", []))
+
+
+def llm_candidate(job, P):
+    """Cheap gate so the model only sees plausible jobs."""
+    if not title_ok(job, P) or re.search(r"\b(intern|internship|part[- ]time)\b", job["title"].lower()):
+        return False
+    blob = job["title"] + " " + job.get("meta", "") + " " + job["text"]
+    return geo_check(job["location"], job["text"], None)[0] or bool(VISA_WORDS.search(blob))
+
+
+def _pay_check(sal, mode, is_c, P, RL):
+    """-> (ok, reject_reason, score_add, reasons)"""
+    if sal["cur"] == "INR":
+        inr_min = P.get("india_min_inr_annual", 5000000)
+        if sal["max"] * PER_MULT[sal["per"]] < inr_min:
+            return False, f"INR pay {fmt_sal(sal)} below {inr_min / 1e5:g} LPA", 0, []
+        return True, "", 25, [f"INR pay >= {inr_min / 1e5:g} LPA"]
+    fx = FX.get(sal["cur"])
+    if fx is None:
+        return True, "", 0, []
+    m = PER_MULT[sal["per"]]
+    lo_a, hi_a = sal["min"] * fx * m, sal["max"] * fx * m
+    band = P.get("contract_hourly_band")
+    if mode == "remote" and is_c and band:
+        if hi_a / 2080 < band[0] or lo_a / 2080 > band[1]:
+            return False, f"contract rate {fmt_sal(sal)} outside ${band[0]}-{band[1]}/hr band", 0, []
+        return True, "", 25, [f"rate fits ${band[0]}-{band[1]}/hr band"]
+    min_ann = RL.get("min_annual_usd", 110000) if mode == "reloc" else P.get("min_annual_usd", 120000)
+    if hi_a < min_ann:
+        return False, f"pay {fmt_sal(sal)} below target", 0, []
+    return True, "", (25 if lo_a >= min_ann else 15), ["pay meets target"]
+
+
+def decide_llm(job, x, P, C):
+    """Decision from the model's structured facts + the profile thresholds -> same ev dict as evaluate()."""
+    def rej(why):
+        return dict(ok=False, score=0, reasons=[], flags=[], tier="", reject=why)
+    RL = P.get("relocation") or {}
+    mine = P.get("years_experience", 4)
+    flags, reasons = [], []
+    if x.get("posting_status") == "closed":
+        return rej("posting closed")
+    et = x.get("employment_type", "unknown")
+    if et in ("part_time", "internship"):
+        return rej(et)
+    fit = int(x.get("role_fit") or 0)
+    if fit < C.get("min_role_fit", 5):
+        return rej(f"role fit {fit}/10")
+    if x.get("seniority") == "staff_plus":
+        return rej("staff+ level")
+    loc_ok = geo_check(job["location"], job["text"], None)[0]
+    india, visa = x.get("india_eligible"), x.get("visa_sponsorship")
+    if x.get("is_remote") == "remote" and (india == "yes" or (india == "unclear" and loc_ok)):
+        mode = "remote"
+    elif RL.get("enabled") and visa == "offered" and x.get("visa_evidence"):
+        cs = [c.lower() for c in RL.get("countries", [])]
+        if cs and not any(c in (job["location"] + " " + job["title"]).lower() for c in cs):
+            return rej("visa role outside relocation countries")
+        mode = "reloc"
+    else:
+        return rej(f"not India-eligible ({india}); visa {visa}")
+    need = x.get("min_years_experience")
+    cap_y = P.get("max_required_years", mine + 1)
+    job["_need"], job["_mine"], job["_mode"] = need, mine, mode
+    job["_visa"] = (x.get("visa_evidence") or "")[:170] if mode == "reloc" else ""
+    blob = f"{job['title']} {job.get('meta', '')} {job['text']}".lower()
+    hits = [k for k in P.get("skills", []) if re.search(r"(?<![\w+#])" + re.escape(k.lower()) + r"(?![\w+#])", blob)]
+    score = fit * 4 + min(30, len(hits) * 5)
+    reasons.append(f"Role fit {fit}/10: {x.get('role_fit_reason', '')[:110]}")
+    if hits:
+        reasons.append("skills: " + ", ".join(hits[:6]))
+    if mode == "reloc":
+        score += 10
+        reasons.append("visa sponsorship stated in posting")
+    elif x.get("remote_scope") in ("worldwide", "apac_or_india"):
+        score += 5
+        reasons.append("worldwide/India-ok")
+    if india == "unclear":
+        flags.append("India eligibility unclear - verify")
+    if need is not None:
+        if need > cap_y:
+            return rej(f"needs {need}+ yrs (you ~{mine})")
+        if need == cap_y and need > mine:
+            score -= 15
+            flags.append(f"asks {need}+ yrs (you ~{mine}) - stretch")
+        elif need <= mine:
+            score += 8
+    elif x.get("seniority") == "senior":
+        score -= 8
+        flags.append("senior level, years not stated")
+    is_c = et in ("contract", "freelance")
+    months, min_m = x.get("contract_months"), P.get("min_contract_months", 12)
+    if is_c and mode == "remote":
+        if months is not None and months < min_m:
+            return rej(f"contract {months}mo < {min_m}mo")
+        if months is None:
+            flags.append("CONTRACT length unknown - confirm >=12 months")
+        else:
+            score += 3
+            reasons.append(f"contract ~{months}mo")
+    elif is_c:
+        flags.append("contract role - sponsorship less likely")
+    sal = None
+    lo, hi = x.get("salary_min"), x.get("salary_max")
+    if lo or hi:
+        lo, hi = float(lo or hi), float(hi or lo)
+        per = x.get("salary_period") or ("year" if hi >= 1000 else "hour")
+        sal = dict(min=min(lo, hi), max=max(lo, hi), cur=(x.get("salary_currency") or "USD").upper(), per=per)
+    if sal is None:
+        sal = job.get("sal") or parse_salary(job["sal_text"]) or parse_salary(job["text"][:5000])
+        if not sal:
+            ri = parse_inr(job["sal_text"] + " " + job["text"][:5000])
+            sal = dict(min=ri[0], max=ri[1], cur="INR", per="year") if ri else None
+    job["_sal"] = sal
+    if sal:
+        ok, why, add, rs = _pay_check(sal, mode, is_c, P, RL)
+        if not ok:
+            return rej(why)
+        score += add
+        reasons += rs
+        tier = "✈️" if mode == "reloc" else ("🔥" if score >= 75 else "✅")
+    else:
+        if not (RL.get("allow_unknown_salary", False) if mode == "reloc" else P.get("allow_unknown_salary", True)):
+            return rej("salary unlisted")
+        loc_l = job["location"].lower()
+        if mode == "remote" and re.search(r"\bindia\b", loc_l) and not re.search(r"worldwide|anywhere|global|apac|asia", loc_l) \
+                and not re.search(r"\busd\b|us\$|\beur\b|paid in (?:usd|dollars|euros?)", job["text"].lower()):
+            return rej("India-based role, pay unlisted (likely INR, need >=50 LPA)")
+        flags.append("salary unlisted")
+        if mode == "remote" and is_c and P.get("contract_hourly_band"):
+            flags.append(f"contract: negotiate ${P['contract_hourly_band'][0]}-{P['contract_hourly_band'][1]}/hr")
+        tier = "✈️❔" if mode == "reloc" else "❔"
+    if job.get("posted"):
+        mins = (time.time() - job["posted"]) / 60
+        score += 10 if mins <= 30 else (5 if mins <= 120 else 0)
+    min_score = C.get("min_score", 50) if sal else max(C.get("min_score", 50), C.get("unknown_salary_min_score", 60))
+    if score < min_score:
+        return rej(f"score {score} < {min_score}")
+    return dict(ok=True, score=min(score, 100), reasons=reasons, flags=flags, tier=tier, reject="")
 
 
 def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=False):
     """Evaluate unseen jobs; sink(job, ev) delivers. Returns stats."""
     st = dict(new=0, match=0, sent=0)
-    cands, batch_fp = [], set()
+    cands, batch_fp, llm_calls = [], set(), 0
     for j in jobs:
         if not j.get("id") or (db.seen(j["id"]) and not ignore_seen):
             continue
@@ -1135,7 +1344,21 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=
         if first_run and not j.get("posted"):
             if not dry: db.mark(j["id"])
             continue
-        ev = evaluate(j, P, C)
+        ev = None
+        if os.environ.get("ANTHROPIC_API_KEY") and llm_candidate(j, P):
+            x = db.llm_get(j["id"])
+            if x is None:
+                if llm_calls >= C.get("max_llm_per_cycle", 60):
+                    continue  # defer to next cycle (not marked seen)
+                x = llm_extract(j, P)
+                llm_calls += 1
+                if x:
+                    db.llm_put(j["id"], x)
+            if x:
+                j["_x"] = x
+                ev = decide_llm(j, x, P, C)
+        if ev is None:
+            ev = evaluate(j, P, C)
         limit = SOURCE_MAX_AGE_H.get(j["source"], 0) * 3600 or max_age_s
         if ev["ok"] and j.get("posted") and time.time() - j["posted"] > limit:
             ev = dict(ev, ok=False, reject="too old")
@@ -1151,7 +1374,7 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=
         cands.append((ev["score"], j, ev))
     st["match"] = len(cands)
     cap, win = C.get("max_per_company", 2), C.get("company_window_days", 30)
-    batch_ck, batch_src, sent_n, llm_calls = {}, {}, 0, 0
+    batch_ck, batch_src, sent_n = {}, {}, 0
     for _, j, ev in sorted(cands, key=lambda x: -x[0]):
         if sent_n >= C.get("max_alerts_per_cycle", 25):
             break
@@ -1159,27 +1382,6 @@ def process(jobs, P, C, db, label, first_run, dry, max_age_s, sink, ignore_seen=
             if not dry: db.mark(j["id"])
             log.info("dead posting skipped: %s", j["url"])
             continue
-        v = llm_verify(j, P, j.get("_mode", "remote")) if llm_calls < C.get("max_llm_per_cycle", 25) else None
-        if v is not None:
-            llm_calls += 1
-            if j.get("_mode") == "reloc" and v.get("visa_sponsorship") != "offered":
-                if not dry: db.mark(j["id"])
-                log.info("model rejected (visa %s): %s", v.get("visa_sponsorship"), j["title"])
-                continue
-            if j.get("_mode") != "reloc" and v.get("india_remote_eligible") == "no":
-                if not dry: db.mark(j["id"])
-                log.info("model rejected (not India-eligible): %s", j["title"])
-                continue
-            my = v.get("min_years_experience")
-            if isinstance(my, int) and my > P.get("max_required_years", j.get("_mine", 4) + 1):
-                if not dry: db.mark(j["id"])
-                log.info("model rejected (%s+ yrs): %s", my, j["title"])
-                continue
-            if isinstance(my, int) and j.get("_need") is None:
-                j["_need"] = my
-            if v.get("visa_evidence") and j.get("_mode") == "reloc":
-                j["_visa"] = v["visa_evidence"][:170]
-            j["_verified"] = True
         ck = company_key(j)
         if ck and cap and db.company_count(ck, win) + batch_ck.get(ck, 0) >= cap:
             if not dry: db.mark(j["id"])
